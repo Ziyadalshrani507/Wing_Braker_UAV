@@ -1,53 +1,80 @@
-import asyncio
+"""Flight control node - FlyToGPS action server over the shared gateway.
+
+Owns the PRIMARY MAVSDK connection (udpin://0.0.0.0:14540) and publishes
+VehicleStatus telemetry for the rest of the stack.
+"""
+
 import threading
-import math
 
 import rclpy
 from rclpy.action import ActionServer
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from wingbreaker_interfaces.action import FlyToGPS
-from mavsdk import System
+from wingbreaker_interfaces.msg import VehicleStatus
+
+from wingbreaker_uav.drone_gateway import DroneGateway, distance_m
 
 
 class FlightNode(Node):
+
     def __init__(self):
         super().__init__('flight_node')
 
-        # asyncio loop in a background thread for MAVSDK
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self._run_loop, daemon=True)
-        self.thread.start()
+        self.declare_parameter('system_address', 'udpin://0.0.0.0:14540')
+        self.declare_parameter('status_rate_hz', 2.0)
+        self.declare_parameter('arrival_radius_m', 40.0)
+        address = str(self.get_parameter('system_address').value)
+        rate = float(self.get_parameter('status_rate_hz').value)
+        # fixed-wing L1 control loiters around targets - it will NOT converge
+        # to a few meters; accept arrival at a realistic radius
+        self.arrival_radius = float(self.get_parameter('arrival_radius_m').value)
 
-        self.drone = System()
-        self.connected = False
-        self.airborne = False   # have we taken off yet?
+        self.gw = DroneGateway(system_address=address, name='flight',
+                               grpc_port=50051)
+        self.gw.start()
 
-        # connect to the drone in the background
-        asyncio.run_coroutine_threadsafe(self._connect(), self.loop)
+        self.status_pub = self.create_publisher(VehicleStatus, 'vehicle_status', 10)
+        self.status_timer = self.create_timer(1.0 / rate, self.publish_status)
 
-        # the action server
-        self.server = ActionServer(
-            self, FlyToGPS, 'fly_to_gps', self.execute_callback)
-        self.get_logger().info('Flight node starting - connecting to drone...')
+        # ReentrantCallbackGroup so cancel requests are processed while a
+        # goal callback is blocking - otherwise cancels queue behind it.
+        self.server = ActionServer(self, FlyToGPS, 'fly_to_gps',
+                                   self.execute_callback,
+                                   callback_group=ReentrantCallbackGroup())
+        # serializes actual flight execution: goals queue here while cancels
+        # stay responsive (cancel handling does not need this lock)
+        self._flight_lock = threading.Lock()
+        self.get_logger().info(
+            'Flight node starting - gateway connecting to %s ...' % address)
 
-    def _run_loop(self):
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
+    # ---------- telemetry ----------
+    def publish_status(self):
+        gw = self.gw
+        msg = VehicleStatus()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.connected = gw.connected
+        msg.armed = gw.armed
+        msg.airborne = gw.in_air
+        pos = gw.position
+        if pos:
+            msg.latitude_deg = pos['lat']
+            msg.longitude_deg = pos['lon']
+            msg.relative_altitude_m = float(pos['rel_alt'])
+        else:
+            msg.latitude_deg = 0.0
+            msg.longitude_deg = 0.0
+            msg.relative_altitude_m = 0.0
+        msg.ground_speed_m_s = float(gw.ground_speed or 0.0)
+        msg.heading_deg = float(gw.heading_deg or 0.0)
+        msg.battery_percent = float(gw.battery_pct)
+        msg.num_satellites = int(gw.num_sats)
+        msg.gps_fix_type = 3 if gw.connected else 0
+        self.status_pub.publish(msg)
 
-    async def _connect(self):
-        await self.drone.connect(system_address="udpin://0.0.0.0:14540")
-        async for state in self.drone.core.connection_state():
-            if state.is_connected:
-                self.get_logger().info('Drone connected!')
-                break
-        async for health in self.drone.telemetry.health():
-            if health.is_global_position_ok and health.is_home_position_ok:
-                self.get_logger().info('Position OK - ready to fly')
-                self.connected = True
-                break
-
-    # ---------- action callback: brain sends a GPS goal ----------
+    # ---------- action ----------
     def execute_callback(self, goal_handle):
         lat = goal_handle.request.latitude
         lon = goal_handle.request.longitude
@@ -55,9 +82,56 @@ class FlightNode(Node):
         self.get_logger().info(
             'Goal: fly to (%.6f, %.6f) alt %.1f' % (lat, lon, alt))
 
-        future = asyncio.run_coroutine_threadsafe(
-            self._fly_to(lat, lon, alt, goal_handle), self.loop)
-        ok = future.result()   # wait for flight to finish
+        with self._flight_lock:
+            return self._execute_flight(goal_handle, lat, lon, alt)
+
+    def _execute_flight(self, goal_handle, lat, lon, alt):
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+            result = FlyToGPS.Result()
+            result.success = False
+            result.message = 'Canceled'
+            return result
+
+        ok = False
+        try:
+            if not self.gw.armed or not self.gw.in_air:
+                self.get_logger().info('Takeoff needed - arming/taking off')
+                self.gw.call(self.gw.arm_and_takeoff(alt), timeout=90.0)
+
+            self.gw.call(self.gw.goto(lat, lon, alt), timeout=10.0)
+
+            # stream feedback until within arrival radius (or canceled)
+            feedback = FlyToGPS.Feedback()
+            import time
+            deadline = time.time() + 300.0
+            while time.time() < deadline:
+                if goal_handle.is_cancel_requested:
+                    self.get_logger().warn('Goal canceled - aborting flight')
+                    ok = False
+                    break
+                pos = self.gw.position
+                if pos:
+                    d = distance_m(pos['lat'], pos['lon'], lat, lon)
+                    feedback.distance_remaining = float(d)
+                    goal_handle.publish_feedback(feedback)
+                    if d < self.arrival_radius:
+                        ok = True
+                        break
+                time.sleep(1.0)
+            if not ok and not (
+                    goal_handle.is_cancel_requested):
+                self.get_logger().warn('Arrival timeout - goal failed')
+        except Exception as e:      # noqa: BLE001
+            self.get_logger().warn('Flight error: %s' % e)
+            ok = False
+
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+            result = FlyToGPS.Result()
+            result.success = False
+            result.message = 'Canceled'
+            return result
 
         goal_handle.succeed()
         result = FlyToGPS.Result()
@@ -65,57 +139,17 @@ class FlightNode(Node):
         result.message = 'Arrived' if ok else 'Flight failed'
         return result
 
-    async def _fly_to(self, lat, lon, alt, goal_handle):
-        if not self.connected:
-            self.get_logger().warn('Drone not connected yet')
-            return False
-
-        try:
-            # arm + takeoff only on the first goal
-            if not self.airborne:
-                await self.drone.action.arm()
-                await self.drone.action.set_takeoff_altitude(alt)
-                await self.drone.action.takeoff()
-                await asyncio.sleep(8)
-                self.airborne = True
-
-            # fly to the GPS location (yaw 0 = facing north)
-            await self.drone.action.goto_location(lat, lon, alt, 0.0)
-
-            # stream feedback: distance to target until close enough
-            feedback = FlyToGPS.Feedback()
-            while True:
-                async for pos in self.drone.telemetry.position():
-                    d = self._distance(
-                        pos.latitude_deg, pos.longitude_deg, lat, lon)
-                    feedback.distance_remaining = float(d)
-                    goal_handle.publish_feedback(feedback)
-                    break
-                if d < 2.0:   # within 2 meters = arrived
-                    break
-                await asyncio.sleep(1.0)
-
-            return True
-
-        except Exception as e:
-            self.get_logger().warn('Flight error: %s' % str(e))
-            return False
-
-    def _distance(self, lat1, lon1, lat2, lon2):
-        # rough distance in meters between two GPS points
-        R = 6371000.0
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-        a = (math.sin(dlat/2)**2 +
-             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
-             math.sin(dlon/2)**2)
-        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-
 
 def main(args=None):
     rclpy.init(args=args)
     node = FlightNode()
-    rclpy.spin(node)
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
     rclpy.shutdown()
 
 
