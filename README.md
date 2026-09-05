@@ -403,7 +403,7 @@ Problems solved during development that are not obvious from the code:
 
 | | |
 |---|---|
-| **[Your Name]** | Airframe design and CAD, printable prototype and assembly system, Gazebo/PX4 model integration, flight dynamics, hardware-in-the-loop bring-up, ROS 2 architecture — brain state machine, flight action server, safety watchdog — simulation worlds |
+| **[Ziyad Alshahrani]** | Airframe design and CAD, printable prototype and assembly system, Gazebo/PX4 model integration, flight dynamics, hardware-in-the-loop bring-up, ROS 2 architecture — brain state machine, flight action server, safety watchdog — simulation worlds |
 | **Khalid ([@xKhalid1](https://github.com/xKhalid1))** | YOLO detection model and training, camera integration and pixel-to-GPS estimation, web dashboard, LLM approval layer, intruder simulation |
 
 ## License
